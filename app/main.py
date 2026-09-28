@@ -45,13 +45,21 @@ the molecule heavy count is a birth-death chain; given closed-interval
 observations of that count at distinct steps it returns their exact joint
 probability and, conditioned on all of them, the exact heavy-count
 distribution at every step, again exactly over Q and never enumerating
-exchange sequences. An eleventh endpoint counts heavy-isotope losses in
+exchange sequences. All three exchange statistics — this trajectory, the
+loss count and the first-passage time below — run one shared integer-weight
+forward recursion with a per-step observation filter: a single model owns
+the up/down/stay integer numerators of the birth-death chain and each
+endpoint only supplies its state expansion (an extra loss tally or
+first-hit marker) and its result summarization; the trajectory's backward
+conditioning pass reuses the same transition definition in reverse. An
+eleventh endpoint counts heavy-isotope losses in
 the same finite-bath exchange: every swap that moves a heavy isotope out
 of the molecule (a down transition) adds one to the loss count while
 same-type swaps and up transitions add nothing, and it returns the exact
 joint probability of the observations together with the exact conditional
-distribution of the total loss count over the whole trajectory, tracked
-as an extra dimension of the same integer-weight forward recursion.
+distribution of the total loss count over the whole trajectory, tracked as
+an extra dimension of the shared integer-weight forward recursion (a down
+move extends the tally, stay and up moves keep it).
 A twelfth endpoint computes first-passage times in the same finite-bath
 exchange: the first step at which the molecule heavy count reaches a
 threshold (0 when the initial count already does, and falling back below
@@ -70,7 +78,7 @@ import re
 import sys
 from fractions import Fraction
 from math import comb, gcd
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
 from pydantic import (
@@ -1455,6 +1463,224 @@ def transfer_derivative(
     return dist
 
 
+# ---------------------------------------------------------------------------
+# Finite-bath exchange: one integer-weight recursion shared by every statistic
+# ---------------------------------------------------------------------------
+#
+# A molecule of ``n`` sites starts with ``h`` heavy isotopes and a bath of
+# ``m`` sites with ``b``; each step picks one molecule site and one bath site
+# uniformly and independently (all ``n*m`` pairs equally likely) and swaps
+# their isotopes — same-type swaps count as steps. The bath holds the
+# remaining ``T - X_t`` heavy isotopes (``T = h + b`` is conserved), so the
+# molecule heavy count X_t is a birth-death chain on 0..n whose one-step
+# transitions all share the denominator ``n*m``, with integer numerators
+#
+#     up(x)   = (n - x) * (T - x)        (light site out, heavy site in)
+#     down(x) = x * (m - T + x)          (heavy site out, light site in)
+#     stay(x) = n*m - up(x) - down(x)    (same-type swaps)
+#
+# which vanish exactly at the feasible boundary
+# max(0, T - m) <= x <= min(n, T). The single class ``ExchangeChain`` below
+# owns this transition table, and every statistic — the molecule heavy-count
+# trajectory, the cumulative heavy-isotope loss (turnover) count and the
+# first-passage time — runs the *same* generic integer-weight forward
+# recursion ``exchange_forward`` over states defined by an ``ExchangeModel``.
+# A model only declares how the state starts, which molecule heavy count a
+# state carries (for the per-step observation filter) and how one transition
+# extends the extra statistic (loss tally, first-hit marker, ...): the
+# transition itself always comes from the shared chain, and the model never
+# recomputes up/down/stay. The trajectory's backward conditioning pass uses
+# the same transition definition in reverse via ``exchange_backward``.
+
+MOVE_STAY = 0
+MOVE_UP = 1
+MOVE_DOWN = 2
+# (direction, new heavy count, integer transition numerator)
+ExchangeMove = Tuple[int, int, int]
+# A recursion state is the bare heavy count for the trajectory, or a
+# (heavy count, extra statistic) tuple for turnover / first passage.
+ExchangeState = Any
+
+
+class ExchangeChain:
+    """The shared finite-bath birth-death chain with integer numerators."""
+
+    def __init__(self, n: int, m: int, h: int, b: int) -> None:
+        self.n = n
+        self.denom = n * m  # every one-step transition has this denominator
+        total = h + b  # conserved heavy-isotope count (molecule + bath)
+        ups = [(n - x) * (total - x) for x in range(n + 1)]
+        downs = [x * (m - total + x) for x in range(n + 1)]
+        stays = [self.denom - ups[x] - downs[x] for x in range(n + 1)]
+        # Precomputed non-zero (direction, new heavy count, numerator) moves
+        # at each heavy count; the zero numerators at the feasible boundary
+        # are dropped once here instead of at every recursion step.
+        self.moves: List[List[ExchangeMove]] = [[] for _ in range(n + 1)]
+        for x in range(n + 1):
+            if stays[x]:
+                self.moves[x].append((MOVE_STAY, x, stays[x]))
+            if ups[x]:
+                self.moves[x].append((MOVE_UP, x + 1, ups[x]))
+            if downs[x]:
+                self.moves[x].append((MOVE_DOWN, x - 1, downs[x]))
+
+
+class ExchangeModel:
+    """Interface deciding state expansion for the shared exchange recursion.
+
+    Subclasses define the statistic carried alongside the molecule heavy
+    count. Every method stays in plain integers; the heavy-count up/down/
+    stay move itself is always supplied by the shared ``ExchangeChain``.
+    """
+
+    def initial_state(self, h: int) -> ExchangeState:
+        """The deterministic recursion state at step 0."""
+        raise NotImplementedError
+
+    def heavy_count(self, state: ExchangeState) -> int:
+        """The molecule heavy count carried by a state (filter key)."""
+        raise NotImplementedError
+
+    def next_state(
+        self, state: ExchangeState, direction: int, new_count: int, step: int
+    ) -> ExchangeState:
+        """The state after one chain move of the given direction."""
+        raise NotImplementedError
+
+
+class TrajectoryModel(ExchangeModel):
+    """No extra statistic: the state is the bare molecule heavy count."""
+
+    def initial_state(self, h: int) -> ExchangeState:
+        return h
+
+    def heavy_count(self, state: ExchangeState) -> int:
+        return state
+
+    def next_state(
+        self, state: ExchangeState, direction: int, new_count: int, step: int
+    ) -> ExchangeState:
+        return new_count
+
+
+class TurnoverModel(ExchangeModel):
+    """State (heavy count x, loss count c); a down move adds one loss."""
+
+    def initial_state(self, h: int) -> ExchangeState:
+        return (h, 0)
+
+    def heavy_count(self, state: ExchangeState) -> int:
+        return state[0]
+
+    def next_state(
+        self, state: ExchangeState, direction: int, new_count: int, step: int
+    ) -> ExchangeState:
+        losses = state[1] + 1 if direction == MOVE_DOWN else state[1]
+        return (new_count, losses)
+
+
+class FirstPassageModel(ExchangeModel):
+    """State (heavy count x, first-hit step tau); tau = -1 means "not yet"."""
+
+    def __init__(self, threshold: int) -> None:
+        self.threshold = threshold
+
+    def initial_state(self, h: int) -> ExchangeState:
+        return (h, 0 if h >= self.threshold else -1)
+
+    def heavy_count(self, state: ExchangeState) -> int:
+        return state[0]
+
+    def next_state(
+        self, state: ExchangeState, direction: int, new_count: int, step: int
+    ) -> ExchangeState:
+        tau = state[1]
+        if tau < 0 and new_count >= self.threshold:
+            tau = step  # first reaching of the threshold; later falls keep it
+        return (new_count, tau)
+
+
+def exchange_forward(
+    chain: ExchangeChain,
+    model: ExchangeModel,
+    h: int,
+    steps: int,
+    filters: Dict[int, Tuple[int, int]],
+) -> List[Dict[ExchangeState, int]]:
+    """The shared exact integer-weight forward recursion for every statistic.
+
+    ``forward[t][state] = A_t[state]`` holds the integer path weight with
+    ``alpha_t(state) = A_t[state] / chain.denom**t``; states reaching the same
+    key are merged. At each observed step every state whose molecule heavy
+    count falls outside that step's closed interval [lower, upper] is zeroed
+    (step 0 filters the deterministic initial state). The up/down/stay moves
+    and their numerators come solely from the shared ``chain``; ``model``
+    only extends the state's extra statistic. No exchange sequence is ever
+    enumerated.
+    """
+    forward: List[Dict[ExchangeState, int]] = []
+    current: Dict[ExchangeState, int] = {}
+    initial = model.initial_state(h)
+    if 0 not in filters:
+        current = {initial: 1}
+    else:
+        lower, upper = filters[0]
+        if lower <= model.heavy_count(initial) <= upper:
+            current = {initial: 1}
+    forward.append(current)
+    for t in range(1, steps + 1):
+        nxt: Dict[ExchangeState, int] = {}
+        for state, weight in current.items():
+            x = model.heavy_count(state)
+            for direction, new_count, numerator in chain.moves[x]:
+                new_state = model.next_state(state, direction, new_count, t)
+                nxt[new_state] = nxt.get(new_state, 0) + weight * numerator
+        if t in filters:
+            lower, upper = filters[t]
+            nxt = {
+                state: weight
+                for state, weight in nxt.items()
+                if lower <= model.heavy_count(state) <= upper
+            }
+        forward.append(nxt)
+        current = nxt
+    return forward
+
+
+def exchange_backward(
+    chain: ExchangeChain,
+    model: ExchangeModel,
+    forward: List[Dict[ExchangeState, int]],
+    filters: Dict[int, Tuple[int, int]],
+    last: int,
+) -> Dict[int, Dict[ExchangeState, int]]:
+    """Backward conditioning weights over the same shared transition table.
+
+    ``backward[t][state] = P(observations after t | state at t) *
+    chain.denom**(last - t)`` for exactly the states surviving the filter at
+    step t; states failing that filter never enter ``forward[t]`` and hence
+    never enter the backward table either. Each reverse move uses the very
+    same ``ExchangeChain`` numerators and the same ``model.next_state``
+    extension as the forward pass, so conditioning never re-derives the
+    transition definition.
+    """
+    backward: Dict[int, Dict[ExchangeState, int]] = {
+        last: {state: 1 for state in forward[last]}
+    }
+    for t in range(last, 0, -1):
+        following = backward[t]
+        prev: Dict[ExchangeState, int] = {}
+        for state in forward[t - 1]:
+            x = model.heavy_count(state)
+            value = 0
+            for direction, new_count, numerator in chain.moves[x]:
+                target = model.next_state(state, direction, new_count, t)
+                value += numerator * following.get(target, 0)
+            prev[state] = value
+        backward[t - 1] = prev
+    return backward
+
+
 def exchange_trajectory(
     n: int,
     m: int,
@@ -1465,78 +1691,31 @@ def exchange_trajectory(
 ) -> Tuple[Fraction, Optional[List[Dict[int, Fraction]]]]:
     """Exact finite-bath exchange-trajectory inference, over Q.
 
-    A molecule of ``n`` sites starts with ``h`` heavy isotopes and a bath of
-    ``m`` sites with ``b``; each step picks one molecule site and one bath
-    site uniformly and independently (all ``n*m`` pairs equally likely) and
-    swaps their isotopes — same-type swaps count as steps. The bath holds
-    the remaining ``T - X_t`` heavy isotopes (``T = h + b`` is conserved),
-    so the molecule heavy count X_t is a birth-death chain on 0..n whose
-    one-step transitions all share the denominator ``n*m``, with integer
-    numerators
+    Runs the shared integer-weight recursion
+    (``exchange_forward``/``exchange_backward``) with the bare heavy-count
+    ``TrajectoryModel``; ``observations`` lists ``(step, lower, upper)``
+    constraints ``lower <= X_step <= upper`` at distinct steps (step 0 is the
+    initial state, X_0 = h). Returns the exact joint probability of all
+    observations and, when it is non-zero, for every step 0..steps the
+    conditional distribution of X_t given all observations as a count ->
+    probability mapping; a zero joint probability yields ``(0, None)``.
 
-        up(x)   = (n - x) * (T - x)        (light site out, heavy site in)
-        down(x) = x * (m - T + x)          (heavy site out, light site in)
-        stay(x) = n*m - up(x) - down(x)    (same-type swaps)
-
-    which vanish exactly at the feasible boundary
-    max(0, T - m) <= x <= min(n, T). ``observations`` lists
-    ``(step, lower, upper)`` constraints ``lower <= X_step <= upper`` at
-    distinct steps (step 0 is the initial state, X_0 = h). Returns the
-    exact joint probability of all observations and, when it is non-zero,
-    for every step 0..steps the conditional distribution of X_t given all
-    observations as a count -> probability mapping; a zero joint
-    probability yields ``(0, None)``.
-
-    The forward pass tracks exact integer weights ``A_t`` with
-    ``alpha_t(x) = A_t[x] / (n*m)**t``, zeroing every state that violates
-    the observation at its step; the remaining mass at the last observed
-    step ``last`` is the joint probability ``z / (n*m)**last``. The
-    backward pass tracks ``B_t(x) = P(later observations | X_t = x) *
-    (n*m)**(last - t)`` over the same integer weights, so each conditional
-    probability is the single Fraction reduction
-    ``A_t[x] * B_t[x] / z``; steps after ``last`` carry ``B = 1`` and pick
-    up the denominator factor ``(n*m)**(t - last)``. No exchange sequence
-    is ever enumerated.
+    With observations the remaining mass at the last observed step ``last``
+    is the joint probability ``z / (n*m)**last``; forward weights times
+    backward weights give each conditional probability as the single
+    Fraction reduction ``A_t[x] * B_t[x] / z``, and steps after ``last``
+    carry ``B = 1`` with denominator factor ``(n*m)**(t - last)``. With no
+    observations the event is certain and each step's law is the
+    unconditional ``A_t[x] / (n*m)**t``. No exchange sequence is ever
+    enumerated.
     """
-    total = h + b  # conserved heavy-isotope count (molecule + bath)
-    denom = n * m  # every one-step transition has this denominator
-
-    # Integer transition numerators at molecule heavy count x.
-    ups = [(n - x) * (total - x) for x in range(n + 1)]
-    downs = [x * (m - total + x) for x in range(n + 1)]
-    stays = [denom - ups[x] - downs[x] for x in range(n + 1)]
-
+    chain = ExchangeChain(n, m, h, b)
     filters = {step: (lower, upper) for step, lower, upper in observations}
-
-    # Forward pass over exact integer weights: alpha_t(x) = A_t[x]/denom**t,
-    # with states violating an observation zeroed at its step.
-    forward: List[Dict[int, int]] = []
-    current: Dict[int, int] = {h: 1}
-    if 0 in filters:
-        lower, upper = filters[0]
-        if not lower <= h <= upper:
-            current = {}
-    forward.append(current)
-    for t in range(1, steps + 1):
-        nxt: Dict[int, int] = {}
-        for x, weight in current.items():
-            if stays[x]:
-                nxt[x] = nxt.get(x, 0) + weight * stays[x]
-            if ups[x]:
-                nxt[x + 1] = nxt.get(x + 1, 0) + weight * ups[x]
-            if downs[x]:
-                nxt[x - 1] = nxt.get(x - 1, 0) + weight * downs[x]
-        if t in filters:
-            lower, upper = filters[t]
-            nxt = {x: w for x, w in nxt.items() if lower <= x <= upper}
-        forward.append(nxt)
-        current = nxt
+    forward = exchange_forward(chain, TrajectoryModel(), h, steps, filters)
 
     if not filters:
-        # No observations: the joint event is certain and the conditional
-        # law at step t is the unconditional one.
         distributions = [
-            {x: Fraction(weight, denom**t) for x, weight in forward[t].items()}
+            {x: Fraction(weight, chain.denom**t) for x, weight in forward[t].items()}
             for t in range(steps + 1)
         ]
         return Fraction(1), distributions
@@ -1545,25 +1724,9 @@ def exchange_trajectory(
     z_num = sum(forward[last].values())
     if z_num == 0:
         return Fraction(0), None
-    probability = Fraction(z_num, denom**last)
+    probability = Fraction(z_num, chain.denom**last)
 
-    # Backward pass over the same integer weights:
-    # B_t(x) = P(observations after t | X_t = x) * denom**(last - t); states
-    # failing the filter at t simply never enter backward[t].
-    backward: Dict[int, Dict[int, int]] = {last: {x: 1 for x in forward[last]}}
-    for t in range(last, 0, -1):
-        following = backward[t]
-        prev: Dict[int, int] = {}
-        for x in forward[t - 1]:
-            value = 0
-            if stays[x]:
-                value += stays[x] * following.get(x, 0)
-            if ups[x]:
-                value += ups[x] * following.get(x + 1, 0)
-            if downs[x]:
-                value += downs[x] * following.get(x - 1, 0)
-            prev[x] = value
-        backward[t - 1] = prev
+    backward = exchange_backward(chain, TrajectoryModel(), forward, filters, last)
 
     distributions = []
     for t in range(steps + 1):
@@ -1574,7 +1737,7 @@ def exchange_trajectory(
                 if joint:
                     step_dist[x] = Fraction(joint, z_num)
         else:
-            scale = z_num * denom ** (t - last)
+            scale = z_num * chain.denom ** (t - last)
             for x, weight in forward[t].items():
                 step_dist[x] = Fraction(weight, scale)
         distributions.append(step_dist)
@@ -1591,83 +1754,42 @@ def exchange_turnover(
 ) -> Tuple[Fraction, Optional[Dict[int, Fraction]]]:
     """Exact finite-bath exchange loss-count (turnover) inference, over Q.
 
-    The exchange dynamics are exactly those of ``exchange_trajectory``:
-    each step picks one of the ``n*m`` (molecule site, bath site) pairs
-    uniformly and swaps (same-type swaps count as steps), so the molecule
-    heavy count X_t is a birth-death chain with integer transition
-    numerators up/down/stay over the common denominator ``n*m``. The loss
-    count C_t additionally increments by 1 on every down transition (a
-    heavy isotope leaves the molecule); same-type swaps and up
-    transitions leave it unchanged, and repeated outflows accumulate one
-    by one. ``observations`` lists ``(step, lower, upper)`` constraints
-    on X_t at distinct steps (step 0 is the initial state X_0 = h).
-    Returns the exact joint probability of all observations and, when it
-    is non-zero, the exact conditional distribution of the total loss
-    count C_steps given all of them as a count -> probability mapping; a
-    zero joint probability yields ``(0, None)``.
+    Runs the shared integer-weight recursion (``exchange_forward``) with
+    ``TurnoverModel``: the state is (heavy count, loss count) and every down
+    transition (a heavy isotope leaves the molecule) extends the loss count
+    by one while same-type swaps and up transitions leave it unchanged;
+    repeated outflows (round trips such as 1 -> 0 -> 1 or 1 -> 2 -> 1 versus
+    staying at 1) occupy distinct cells and are merged only when the marginal
+    is read off. ``observations`` lists ``(step, lower, upper)`` constraints
+    on X_t at distinct steps (step 0 is the initial state X_0 = h). Returns
+    the exact joint probability of all observations and, when it is non-zero,
+    the exact conditional distribution of the total loss count C_steps given
+    all of them as a count -> probability mapping; a zero joint probability
+    yields ``(0, None)``.
 
-    The forward recursion carries exact integer weights keyed by the
-    joint state (heavy count, loss count): A_t[(x, c)] with
-    alpha_t(x, c) = A_t[(x, c)] / (n*m)**t, zeroing every state that
-    violates the observation at its step. Paths that end at the same
-    heavy count but accumulated different loss counts (round trips such
-    as 1 -> 0 -> 1 or 1 -> 2 -> 1 versus staying at 1) occupy distinct
-    cells and are merged only when the loss-count marginal is read off,
-    so every outflow is counted separately as required. The remaining
-    mass at step ``steps`` gives the joint probability
-    ``z / (n*m)**steps`` and each conditional loss probability is the
-    single Fraction reduction ``weight_c / z``. No exchange sequence is
-    ever enumerated.
+    The surviving mass at step ``steps`` gives the joint probability
+    ``z / (n*m)**steps`` and each conditional loss probability is the single
+    Fraction reduction ``weight_c / z``. No exchange sequence is ever
+    enumerated.
     """
-    total = h + b  # conserved heavy-isotope count (molecule + bath)
-    denom = n * m  # every one-step transition has this denominator
-
-    # Integer transition numerators at molecule heavy count x.
-    ups = [(n - x) * (total - x) for x in range(n + 1)]
-    downs = [x * (m - total + x) for x in range(n + 1)]
-    stays = [denom - ups[x] - downs[x] for x in range(n + 1)]
-
+    chain = ExchangeChain(n, m, h, b)
     filters = {step: (lower, upper) for step, lower, upper in observations}
+    forward = exchange_forward(chain, TurnoverModel(), h, steps, filters)
 
-    # Forward pass over exact integer weights keyed by (heavy count, loss
-    # count): alpha_t(x, c) = current[(x, c)] / denom**t, with states
-    # violating an observation zeroed at its step.
-    current: Dict[Tuple[int, int], int] = {(h, 0): 1}
-    if 0 in filters:
-        lower, upper = filters[0]
-        if not lower <= h <= upper:
-            current = {}
-    for t in range(1, steps + 1):
-        nxt: Dict[Tuple[int, int], int] = {}
-        for (x, c), weight in current.items():
-            if stays[x]:
-                key = (x, c)
-                nxt[key] = nxt.get(key, 0) + weight * stays[x]
-            if ups[x]:
-                key = (x + 1, c)
-                nxt[key] = nxt.get(key, 0) + weight * ups[x]
-            if downs[x]:
-                key = (x - 1, c + 1)
-                nxt[key] = nxt.get(key, 0) + weight * downs[x]
-        if t in filters:
-            lower, upper = filters[t]
-            nxt = {
-                key: w for key, w in nxt.items() if lower <= key[0] <= upper
-            }
-        current = nxt
-
-    z_num = sum(current.values())
+    z_num = sum(forward[steps].values())
     if z_num == 0:
         return Fraction(0), None
-    probability = Fraction(z_num, denom**steps)
+    probability = Fraction(z_num, chain.denom**steps)
 
     # Marginalize the heavy count: each loss count's conditional weight is
     # reduced exactly once against the surviving total mass.
     losses: Dict[int, int] = {}
-    for (_x, c), weight in current.items():
-        losses[c] = losses.get(c, 0) + weight
+    for (_x, count), weight in forward[steps].items():
+        losses[count] = losses.get(count, 0) + weight
     distribution = {
-        c: Fraction(weight, z_num) for c, weight in losses.items() if weight
+        count: Fraction(weight, z_num)
+        for count, weight in losses.items()
+        if weight
     }
     return probability, distribution
 
@@ -1683,90 +1805,43 @@ def exchange_first_passage(
 ) -> Tuple[Fraction, Optional[Dict[int, Fraction]], Optional[Fraction]]:
     """Exact first-passage inference for the finite-bath exchange, over Q.
 
-    The exchange dynamics are exactly those of ``exchange_trajectory``:
-    each step picks one of the ``n*m`` (molecule site, bath site) pairs
-    uniformly and swaps (same-type swaps count as steps), so the molecule
-    heavy count X_t is a birth-death chain with integer transition
-    numerators up/down/stay over the common denominator ``n*m``. The
-    first-passage time tau is the first step at which X_t >= ``threshold``
-    (tau = 0 when the initial count h already qualifies); once the
-    threshold has been reached, falling back below it does not undo the
-    hit. ``observations`` lists ``(step, lower, upper)`` constraints on
-    X_t at distinct steps (step 0 is the initial state X_0 = h). Returns
-    the exact joint probability of all observations and, when it is
-    non-zero, the exact conditional distribution of tau over 0..steps
-    given all of them as a step -> probability mapping together with the
-    conditional probability of never reaching the threshold within the
-    horizon; a zero joint probability yields ``(0, None, None)``.
+    Runs the shared integer-weight recursion (``exchange_forward``) with
+    ``FirstPassageModel``: the state is (heavy count, first-hit step tau),
+    tau = -1 marking "threshold not reached yet". A not-yet-hit state that
+    crosses ``threshold`` on step t moves to tau = t; states already carrying
+    a first-hit step keep it whatever the later counts are, so a path that
+    reaches the threshold and falls back below it is still credited with its
+    first reaching time. ``observations`` lists ``(step, lower, upper)``
+    constraints on X_t at distinct steps (step 0 is the initial state
+    X_0 = h, and tau = 0 when h already qualifies). Returns the exact joint
+    probability of all observations and, when it is non-zero, the exact
+    conditional distribution of tau over 0..steps given all of them as a
+    step -> probability mapping together with the conditional probability of
+    never reaching the threshold within the horizon; a zero joint
+    probability yields ``(0, None, None)``.
 
-    The forward recursion carries exact integer weights keyed by the
-    joint state (heavy count, first-hit step): A_t[(x, tau)] with
-    alpha_t(x, tau) = A_t[(x, tau)] / (n*m)**t, where tau = -1 marks
-    "threshold not reached yet" and zeroing every state that violates
-    the observation at its step. A not-yet-hit state that crosses the
-    threshold on step t moves to tau = t; states already carrying a
-    first-hit step keep it whatever the later counts are, so a path
-    that reaches the threshold and falls back is still credited with
-    its first reaching time. Paths whose first hit happens at different
-    steps occupy distinct cells and are merged only when the tau
-    marginal is read off. The remaining mass at step ``steps`` gives
-    the joint probability ``z / (n*m)**steps`` and each conditional
-    probability is the single Fraction reduction ``weight / z``; the
-    never-hit mass is the surviving tau = -1 weight. No exchange
-    sequence is ever enumerated.
+    The surviving mass at step ``steps`` gives the joint probability
+    ``z / (n*m)**steps`` and each conditional probability is the single
+    Fraction reduction ``weight / z``; the tau = -1 weight is the never-hit
+    mass. No exchange sequence is ever enumerated.
     """
-    total = h + b  # conserved heavy-isotope count (molecule + bath)
-    denom = n * m  # every one-step transition has this denominator
-
-    # Integer transition numerators at molecule heavy count x.
-    ups = [(n - x) * (total - x) for x in range(n + 1)]
-    downs = [x * (m - total + x) for x in range(n + 1)]
-    stays = [denom - ups[x] - downs[x] for x in range(n + 1)]
-
+    chain = ExchangeChain(n, m, h, b)
     filters = {step: (lower, upper) for step, lower, upper in observations}
+    forward = exchange_forward(
+        chain, FirstPassageModel(threshold), h, steps, filters
+    )
 
-    # Forward pass over exact integer weights keyed by (heavy count x,
-    # first-hit step tau): alpha_t(x, tau) = current[(x, tau)] / denom**t,
-    # with states violating an observation zeroed at its step. tau = -1
-    # marks "threshold not reached yet"; such states always have
-    # x < threshold.
-    current: Dict[Tuple[int, int], int] = {
-        (h, 0 if h >= threshold else -1): 1
-    }
-    if 0 in filters:
-        lower, upper = filters[0]
-        if not lower <= h <= upper:
-            current = {}
-    for t in range(1, steps + 1):
-        nxt: Dict[Tuple[int, int], int] = {}
-        for (x, tau), weight in current.items():
-            for nx, num in ((x, stays[x]), (x + 1, ups[x]), (x - 1, downs[x])):
-                if not num:
-                    continue
-                if tau < 0 and nx >= threshold:
-                    ntau = t  # first reaching of the threshold
-                else:
-                    ntau = tau
-                key = (nx, ntau)
-                nxt[key] = nxt.get(key, 0) + weight * num
-        if t in filters:
-            lower, upper = filters[t]
-            nxt = {
-                key: w for key, w in nxt.items() if lower <= key[0] <= upper
-            }
-        current = nxt
-
-    z_num = sum(current.values())
+    z_num = sum(forward[steps].values())
     if z_num == 0:
         return Fraction(0), None, None
-    probability = Fraction(z_num, denom**steps)
+    probability = Fraction(z_num, chain.denom**steps)
 
     # Marginalize the heavy count: each first-hit step's conditional weight
     # is reduced exactly once against the surviving total mass; the tau = -1
     # weight is the probability of never reaching the threshold by `steps`.
     hits: Dict[int, int] = {}
     never_weight = 0
-    for (_x, tau), weight in current.items():
+    for (_x, tau), weight in forward[steps].items():
         if tau < 0:
             never_weight += weight
         else:
